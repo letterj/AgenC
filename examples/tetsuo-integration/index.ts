@@ -35,6 +35,7 @@
  */
 
 import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { readFileSync } from 'fs';
 import chalk from 'chalk';
 import crypto from 'crypto';
 
@@ -609,7 +610,7 @@ async function main() {
   //   - Environment variable with encrypted key
   // Never commit real keypairs to source control!
   const agentConfig: TetsuoAgentConfig = {
-    wallet: Keypair.generate(), // DEMO ONLY: Load from secure storage in production!
+    wallet: Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.env.SOLANA_KEYPAIR ?? `${process.env.HOME}/.config/solana/id.json`, 'utf-8')))),
     capabilities: [
       'text-generation',
       'code-generation',
