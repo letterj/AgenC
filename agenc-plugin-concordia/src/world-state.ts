@@ -736,6 +736,138 @@ function applyOutcomeToAgentState(
   };
 }
 
+function normalizeEventSummary(event: EventNotification): string {
+  // Audit S1.8: defensive default. The previous code chained
+  // resolved_event ?? content ?? type → trim, but the bridge HTTP
+  // payload could arrive with all three fields missing or non-string,
+  // crashing on `.trim() of undefined`. Coerce each to "" first, then
+  // fall back to `event.type` (also coerced) as the last resort.
+  return (
+    [
+      typeof event.resolved_event === "string" ? event.resolved_event : "",
+      typeof event.content === "string" ? event.content : "",
+      typeof event.type === "string" ? event.type : "",
+    ].find((value) => value.trim().length > 0)?.trim() ||
+    (typeof event.type === "string" ? event.type : "unknown")
+  );
+}
+
+function buildUpdatedClock(
+  clock: WorldStateSnapshot["clock"],
+  step: number,
+): WorldStateSnapshot["clock"] {
+  return {
+    tick: clock.tick + 1,
+    step: Math.max(clock.step, step),
+    phase: clock.phase,
+    updated_at: Date.now(),
+    scene_name: clock.scene_name ?? null,
+    time_of_day: clock.time_of_day ?? null,
+    day_index: clock.day_index ?? null,
+  };
+}
+
+function applyObservationEvent(
+  agentStates: Record<string, EmbodiedAgentState>,
+  actingAgentId: string | null,
+  content: string | undefined,
+): Record<string, EmbodiedAgentState> {
+  if (!actingAgentId || !agentStates[actingAgentId]) {
+    return agentStates;
+  }
+
+  return {
+    ...agentStates,
+    [actingAgentId]: {
+      ...agentStates[actingAgentId],
+      last_observation: content ?? agentStates[actingAgentId].last_observation,
+    },
+  };
+}
+
+function applyResolutionOutcome(
+  agentStates: Record<string, EmbodiedAgentState>,
+  actingAgentId: string | null,
+  outcome: AgentOutcome | null,
+): Record<string, EmbodiedAgentState> {
+  if (!outcome || !actingAgentId || !agentStates[actingAgentId]) {
+    return agentStates;
+  }
+
+  return {
+    ...agentStates,
+    [actingAgentId]: applyOutcomeToAgentState(agentStates[actingAgentId], outcome),
+  };
+}
+
+function resolveEventOutcome(params: {
+  readonly event: EventNotification;
+  readonly actingAgentId: string | null;
+  readonly agentStates: Record<string, EmbodiedAgentState>;
+  readonly summary: string;
+  readonly metadata: Record<string, unknown>;
+  readonly activeSceneId: string | null;
+  readonly activeZoneId: string | null;
+  readonly activeLocationId: string | null;
+}): AgentOutcome | null {
+  const { event, actingAgentId, agentStates, summary, metadata } = params;
+  if (event.type !== "resolution" || !actingAgentId || !agentStates[actingAgentId]) {
+    return event.outcome ?? null;
+  }
+
+  return event.outcome ?? {
+    summary,
+    narration: event.resolved_event ?? event.content ?? null,
+    succeeded: true,
+    scene_id: params.activeSceneId,
+    zone_id: params.activeZoneId,
+    location_id: params.activeLocationId,
+    metadata,
+  };
+}
+
+function buildWorldEventFromNotification(params: {
+  readonly event: EventNotification;
+  readonly step: number;
+  readonly timestamp: number;
+  readonly summary: string;
+  readonly actingAgentId: string | null;
+  readonly snapshot: WorldStateSnapshot;
+  readonly outcome: AgentOutcome | null;
+  readonly metadata: Record<string, unknown>;
+}): WorldEvent {
+  return {
+    event_id: undefined,
+    type: params.event.type,
+    step: params.step,
+    timestamp: params.timestamp,
+    summary: params.summary,
+    agent_id: params.actingAgentId,
+    agent_name: params.event.agent_name ?? params.actingAgentId ?? null,
+    scene_id: params.snapshot.active_scene_id,
+    zone_id: params.snapshot.active_zone_id,
+    location_id: params.snapshot.active_location_id,
+    intent: params.event.intent ?? null,
+    outcome: params.outcome,
+    metadata: params.metadata,
+  };
+}
+
+function finalizeEventSnapshot(
+  snapshot: MutableWorldStateSnapshot,
+  worldEvent: WorldEvent,
+  summary: string,
+): void {
+  if (worldEvent.type === "scene_change" || worldEvent.type === "world_event") {
+    snapshot.world_facts = mergeWorldFactsFromEvent(snapshot.world_facts, summary);
+  }
+
+  snapshot.agent_states = recalculateNearbyAgents(snapshot.agent_states);
+  snapshot.updated_at = Date.now();
+  snapshot.snapshot_ref = buildSnapshotRef(snapshot);
+  snapshot.recent_events = pushRecentEvent(snapshot, worldEvent);
+}
+
 export function applyEventToWorldState(
   snapshot: WorldStateSnapshot,
   event: EventNotification,
@@ -747,29 +879,10 @@ export function applyEventToWorldState(
   const step = normalizeStep(event, snapshot);
   const timestamp = typeof event.timestamp === "number" ? event.timestamp : Date.now();
   const actingAgentId = event.acting_agent ?? event.agent_name ?? null;
-  // Audit S1.8: defensive default. The previous code chained
-  // resolved_event ?? content ?? type → trim, but the bridge HTTP
-  // payload could arrive with all three fields missing or non-string,
-  // crashing on `.trim() of undefined`. Coerce each to "" first, then
-  // fall back to `event.type` (also coerced) as the last resort.
-  const summary =
-    (
-      (typeof event.resolved_event === "string" ? event.resolved_event : "") ||
-      (typeof event.content === "string" ? event.content : "") ||
-      (typeof event.type === "string" ? event.type : "")
-    ).trim() ||
-    (typeof event.type === "string" ? event.type : "unknown");
+  const summary = normalizeEventSummary(event);
   const metadata = normalizedEventMetadata(event);
 
-  next.clock = {
-    tick: next.clock.tick + 1,
-    step: Math.max(next.clock.step, step),
-    phase: next.clock.phase,
-    updated_at: Date.now(),
-    scene_name: next.clock.scene_name ?? null,
-    time_of_day: next.clock.time_of_day ?? null,
-    day_index: next.clock.day_index ?? null,
-  };
+  next.clock = buildUpdatedClock(next.clock, step);
 
   if (event.scene || metadata.scene_id || metadata.scene_name) {
     applySceneMetadata(next, metadata, event.scene ?? null);
@@ -782,14 +895,8 @@ export function applyEventToWorldState(
     };
   }
 
-  if (event.type === "observation" && actingAgentId && next.agent_states[actingAgentId]) {
-    next.agent_states = {
-      ...next.agent_states,
-      [actingAgentId]: {
-        ...next.agent_states[actingAgentId],
-        last_observation: event.content ?? next.agent_states[actingAgentId].last_observation,
-      },
-    };
+  if (event.type === "observation") {
+    next.agent_states = applyObservationEvent(next.agent_states, actingAgentId, event.content);
   }
 
   if (event.type === "terminate") {
@@ -799,48 +906,30 @@ export function applyEventToWorldState(
     };
   }
 
-  const resolutionOutcome = event.type === "resolution" && actingAgentId && next.agent_states[actingAgentId]
-    ? event.outcome ?? {
-        summary,
-        narration: event.resolved_event ?? event.content ?? null,
-        succeeded: true,
-        scene_id: next.active_scene_id,
-        zone_id: next.active_zone_id,
-        location_id: next.active_location_id,
-        metadata,
-      }
-    : event.outcome ?? null;
+  const resolutionOutcome = resolveEventOutcome({
+    event,
+    actingAgentId,
+    agentStates: next.agent_states,
+    summary,
+    metadata,
+    activeSceneId: next.active_scene_id,
+    activeZoneId: next.active_zone_id,
+    activeLocationId: next.active_location_id,
+  });
 
-  if (resolutionOutcome && actingAgentId && next.agent_states[actingAgentId]) {
-    next.agent_states = {
-      ...next.agent_states,
-      [actingAgentId]: applyOutcomeToAgentState(next.agent_states[actingAgentId], resolutionOutcome),
-    };
-  }
+  next.agent_states = applyResolutionOutcome(next.agent_states, actingAgentId, resolutionOutcome);
 
-  const worldEvent: WorldEvent = {
-    event_id: undefined,
-    type: event.type,
+  const worldEvent = buildWorldEventFromNotification({
+    event,
     step,
     timestamp,
     summary,
-    agent_id: actingAgentId,
-    agent_name: event.agent_name ?? actingAgentId ?? null,
-    scene_id: next.active_scene_id,
-    zone_id: next.active_zone_id,
-    location_id: next.active_location_id,
-    intent: event.intent ?? null,
+    actingAgentId,
+    snapshot: next,
     outcome: resolutionOutcome,
     metadata,
-  };
+  });
 
-  if (event.type === "scene_change" || event.type === "world_event") {
-    next.world_facts = mergeWorldFactsFromEvent(next.world_facts, summary);
-  }
-
-  next.agent_states = recalculateNearbyAgents(next.agent_states);
-  next.updated_at = Date.now();
-  next.snapshot_ref = buildSnapshotRef(next);
-  next.recent_events = pushRecentEvent(next, worldEvent);
+  finalizeEventSnapshot(next, worldEvent, summary);
   return { snapshot: next, worldEvent };
 }
