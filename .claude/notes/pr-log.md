@@ -25,3 +25,10 @@
 - **What worked:** normalizing and parsing labeled multiple-choice replies in the Concordia runner removed the brittle exact-match failure that was crashing GM resolution on valid answers like `(a) Yes`
 - **What didn't:** this verifies the parser path and engine tests, but a fresh live sim replay is still the best follow-up for full runtime confidence
 - **Rule added to CLAUDE.md:** no
+
+## PR #1555: docs(umbrella): remove roadmap TODO files
+- **Date:** 2026-04-13
+- **Files changed:** `TODO.MD`, root note updates
+- **What worked:** removing the tracked shipped-roadmap file and the untracked local companion eliminated a stale product-planning surface that no longer belonged in the public umbrella repo.
+- **What didn't:** the umbrella repo still has unrelated local-only changes outside this PR, so the cleanup stays narrowly scoped to the roadmap files.
+- **Rule added to CLAUDE.md:** no
