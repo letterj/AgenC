@@ -41,6 +41,7 @@ const HIGH_FUNCTION_THRESHOLD = 100;
 const HIGH_DUPLICATE_LINES = 20;
 const HIGH_NESTING_DEPTH = 5;
 const MEDIUM_NESTING_DEPTH = 4;
+const BRACE_LANGUAGE_EXTENSIONS = new Set(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts', '.rs', '.go', '.sh']);
 
 function findWorkspaceRoot(startDir) {
   let current = path.resolve(startDir);
@@ -104,10 +105,7 @@ function addDuplication(list, pattern, locations, lines, refactorTo) {
   list.push({ pattern, locations, lines, refactorTo });
 }
 
-function analyzeFile(relPath, text, aggregate) {
-  const lines = text.split('\n');
-  const extension = path.extname(relPath);
-
+function analyzeTodoComments(relPath, lines, aggregate) {
   for (let index = 0; index < lines.length; index += 1) {
     const todoMatch = lines[index].match(/\b(TODO|FIXME|HACK)\b[:\s-]*(.*)$/u);
     if (!todoMatch) {
@@ -121,7 +119,9 @@ function analyzeFile(relPath, text, aggregate) {
       'Resolve the note or convert it into a tracked issue with a short context comment.',
     );
   }
+}
 
+function collectDuplicateWindows(relPath, lines, aggregate) {
   for (let index = 0; index <= lines.length - DUPLICATE_WINDOW_LINES; index += 1) {
     const normalizedWindow = lines
       .slice(index, index + DUPLICATE_WINDOW_LINES)
@@ -143,6 +143,14 @@ function analyzeFile(relPath, text, aggregate) {
       });
     }
   }
+}
+
+function analyzeFile(relPath, text, aggregate) {
+  const lines = text.split('\n');
+  const extension = path.extname(relPath);
+
+  analyzeTodoComments(relPath, lines, aggregate);
+  collectDuplicateWindows(relPath, lines, aggregate);
 
   analyzeLongFunctions(relPath, extension, lines, aggregate);
   analyzeNesting(relPath, extension, lines, aggregate);
@@ -150,7 +158,7 @@ function analyzeFile(relPath, text, aggregate) {
 }
 
 function analyzeLongFunctions(relPath, extension, lines, aggregate) {
-  if (['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts', '.rs', '.go', '.sh'].includes(extension)) {
+  if (BRACE_LANGUAGE_EXTENSIONS.has(extension)) {
     analyzeBraceFunctions(relPath, lines, aggregate);
     return;
   }
@@ -159,34 +167,57 @@ function analyzeLongFunctions(relPath, extension, lines, aggregate) {
   }
 }
 
-function analyzeBraceFunctions(relPath, lines, aggregate) {
+function isBraceFunctionStart(line) {
   const functionStartPattern =
     /^\s*(?:export\s+)?(?:pub\s+)?(?:async\s+)?(?:fn\s+\w+|function\s+\w+|const\s+\w+\s*=\s*(?:async\s*)?\(|let\s+\w+\s*=\s*(?:async\s*)?\(|var\s+\w+\s*=\s*(?:async\s*)?\(|\w+\s*:\s*(?:async\s*)?\(|\w+\s*\([^;]*\)\s*\{)/u;
   const controlPattern = /^\s*(?:if|for|while|switch|catch|else)\b/u;
+  return functionStartPattern.test(line) && !controlPattern.test(line);
+}
 
+function stripBraceScanNoise(line) {
+  return line
+    .replace(/\/\/.*$/u, '')
+    .replace(/\/(?:\\.|[^\/\\\n])+\/[dgimsuvy]*/gu, '//')
+    .replace(/"(?:\\.|[^"\\])*"/gu, '""')
+    .replace(/'(?:\\.|[^'\\])*'/gu, "''")
+    .replace(/`(?:\\.|[^`\\])*`/gu, '``');
+}
+
+function countBraces(line) {
+  const sanitized = stripBraceScanNoise(line);
+  return {
+    opens: (sanitized.match(/\{/gu) || []).length,
+    closes: (sanitized.match(/\}/gu) || []).length,
+  };
+}
+
+function findBraceFunctionEnd(lines, startIndex) {
+  let depth = 0;
+  let sawOpeningBrace = false;
+  let endIndex = startIndex;
+
+  for (let cursor = startIndex; cursor < lines.length; cursor += 1) {
+    const { opens, closes } = countBraces(lines[cursor]);
+    if (opens > 0) {
+      sawOpeningBrace = true;
+    }
+    depth += opens - closes;
+    endIndex = cursor;
+    if (sawOpeningBrace && depth <= 0) {
+      break;
+    }
+  }
+
+  return endIndex;
+}
+
+function analyzeBraceFunctions(relPath, lines, aggregate) {
   for (let index = 0; index < lines.length; index += 1) {
-    if (!functionStartPattern.test(lines[index]) || controlPattern.test(lines[index])) {
+    if (!isBraceFunctionStart(lines[index])) {
       continue;
     }
 
-    let depth = 0;
-    let sawOpeningBrace = false;
-    let endIndex = index;
-
-    for (let cursor = index; cursor < lines.length; cursor += 1) {
-      const currentLine = lines[cursor];
-      const opens = (currentLine.match(/\{/gu) || []).length;
-      const closes = (currentLine.match(/\}/gu) || []).length;
-      if (opens > 0) {
-        sawOpeningBrace = true;
-      }
-      depth += opens - closes;
-      endIndex = cursor;
-      if (sawOpeningBrace && depth <= 0) {
-        break;
-      }
-    }
-
+    const endIndex = findBraceFunctionEnd(lines, index);
     const span = endIndex - index + 1;
     if (span <= LONG_FUNCTION_THRESHOLD) {
       continue;
@@ -363,83 +394,103 @@ function dedupeIssues(issues) {
   });
 }
 
-const repoRoot = findWorkspaceRoot(process.cwd());
-const trackedFiles = getTrackedFiles(repoRoot).filter(isSourceFile);
-const aggregate = {
-  critical: [],
-  high: [],
-  medium: [],
-  duplicateMap: new Map(),
-};
-
-for (const relPath of trackedFiles) {
-  const absPath = path.join(repoRoot, relPath);
-  let text;
-  try {
-    text = readFileSync(absPath, 'utf8');
-  } catch {
-    continue;
-  }
-  if (text.includes('\0')) {
-    continue;
-  }
-  analyzeFile(relPath, text, aggregate);
+function createAggregate() {
+  return {
+    critical: [],
+    high: [],
+    medium: [],
+    duplicateMap: new Map(),
+  };
 }
 
-const duplications = [];
-for (const [fingerprint, info] of aggregate.duplicateMap.entries()) {
-  if (info.locations.length < 2) {
-    continue;
+function analyzeTrackedFiles(repoRoot) {
+  const trackedFiles = getTrackedFiles(repoRoot).filter(isSourceFile);
+  const aggregate = createAggregate();
+
+  for (const relPath of trackedFiles) {
+    const absPath = path.join(repoRoot, relPath);
+    let text;
+    try {
+      text = readFileSync(absPath, 'utf8');
+    } catch {
+      continue;
+    }
+    if (text.includes('\0')) {
+      continue;
+    }
+    analyzeFile(relPath, text, aggregate);
   }
-  const lineCount = fingerprint.split('\n').length;
-  addDuplication(
-    duplications,
-    `Exact duplicate window (${lineCount} normalized lines)`,
-    info.locations.slice(0, 4).join(', '),
-    `${lineCount} lines`,
-    'Extract a shared helper or reduce the repeated validation/state-update block.',
-  );
-  if (lineCount >= HIGH_DUPLICATE_LINES) {
-    addIssue(
-      aggregate.high,
-      `Exact duplicate block (${lineCount} lines)`,
-      info.locations.slice(0, 2).join(', '),
-      'Duplicated logic increases regression risk because fixes can diverge.',
-      'Centralize the shared block behind one helper or shared module.',
+
+  return aggregate;
+}
+
+function collectDuplicationIssues(aggregate) {
+  const duplications = [];
+
+  for (const [fingerprint, info] of aggregate.duplicateMap.entries()) {
+    if (info.locations.length < 2) {
+      continue;
+    }
+    const lineCount = fingerprint.split('\n').length;
+    addDuplication(
+      duplications,
+      `Exact duplicate window (${lineCount} normalized lines)`,
+      info.locations.slice(0, 4).join(', '),
+      `${lineCount} lines`,
+      'Extract a shared helper or reduce the repeated validation/state-update block.',
     );
+    if (lineCount >= HIGH_DUPLICATE_LINES) {
+      addIssue(
+        aggregate.high,
+        `Exact duplicate block (${lineCount} lines)`,
+        info.locations.slice(0, 2).join(', '),
+        'Duplicated logic increases regression risk because fixes can diverge.',
+        'Centralize the shared block behind one helper or shared module.',
+      );
+    }
   }
+
+  return duplications;
 }
 
-const critical = dedupeIssues(aggregate.critical);
-const high = dedupeIssues(aggregate.high);
-const medium = dedupeIssues(aggregate.medium);
-const totalIssues = critical.length + high.length + medium.length;
-const estimatedCleanupFiles = new Set(
-  [...critical, ...high, ...medium].map((issue) => issue.location.split(':')[0]),
-).size;
-const recommendedPriority =
-  critical[0]?.issue || high[0]?.issue || medium[0]?.issue || 'No significant issues detected';
+function summarizeAggregate(aggregate) {
+  const critical = dedupeIssues(aggregate.critical);
+  const high = dedupeIssues(aggregate.high);
+  const medium = dedupeIssues(aggregate.medium);
+  const totalIssues = critical.length + high.length + medium.length;
+  const estimatedCleanupFiles = new Set(
+    [...critical, ...high, ...medium].map((issue) => issue.location.split(':')[0]),
+  ).size;
+  const recommendedPriority =
+    critical[0]?.issue || high[0]?.issue || medium[0]?.issue || 'No significant issues detected';
 
-const reportDate = new Date().toISOString().slice(0, 10);
-const outputPath = path.join(repoRoot, '.claude', 'notes', `techdebt-${reportDate}.md`);
-mkdirSync(path.dirname(outputPath), { recursive: true });
+  return {
+    critical,
+    high,
+    medium,
+    totalIssues,
+    estimatedCleanupFiles,
+    recommendedPriority,
+  };
+}
 
-const report = `## Tech Debt Report - ${reportDate}
+function renderReport(summary, duplications, reportDate) {
+  return `## Tech Debt Report - ${reportDate}
 
 ### Critical (Fix Now)
 | Issue | Location | Impact | Suggested Fix |
 |-------|----------|--------|---------------|
-${renderIssueTable(critical, 'Fix the issue before merging further changes in the same area.')}
+${renderIssueTable(summary.critical, 'Fix the issue before merging further changes in the same area.')}
 
 ### High (Fix This Sprint)
 | Issue | Location | Impact | Suggested Fix |
 |-------|----------|--------|---------------|
-${renderIssueTable(high, 'Refactor the affected area before more logic accumulates around it.')}
+${renderIssueTable(summary.high, 'Refactor the affected area before more logic accumulates around it.')}
 
 ### Medium (Backlog)
 | Issue | Location | Impact | Suggested Fix |
 |-------|----------|--------|---------------|
-${renderIssueTable(medium, 'Track it and clean it up when the surrounding file is touched next.')}
+${renderIssueTable(summary.medium, 'Track it and clean it up when the surrounding file is touched next.')}
 
 ### Duplications Found
 | Pattern | Locations | Lines | Refactor To |
@@ -447,11 +498,21 @@ ${renderIssueTable(medium, 'Track it and clean it up when the surrounding file i
 ${renderDuplicationTable(duplications)}
 
 ### Summary
-- Total issues: ${totalIssues}
-- Estimated cleanup: ${estimatedCleanupFiles} files
-- Recommended priority: ${recommendedPriority}
+- Total issues: ${summary.totalIssues}
+- Estimated cleanup: ${summary.estimatedCleanupFiles} files
+- Recommended priority: ${summary.recommendedPriority}
 `;
+}
 
+const repoRoot = findWorkspaceRoot(process.cwd());
+const aggregate = analyzeTrackedFiles(repoRoot);
+const duplications = collectDuplicationIssues(aggregate);
+const summary = summarizeAggregate(aggregate);
+const reportDate = new Date().toISOString().slice(0, 10);
+const outputPath = path.join(repoRoot, '.claude', 'notes', `techdebt-${reportDate}.md`);
+mkdirSync(path.dirname(outputPath), { recursive: true });
+
+const report = renderReport(summary, duplications, reportDate);
 writeFileSync(outputPath, `${report}\n`, 'utf8');
 process.stdout.write(`Wrote ${path.relative(repoRoot, outputPath)}\n`);
-process.stdout.write(`Found ${totalIssues} issues. Recommended priority: ${recommendedPriority}\n`);
+process.stdout.write(`Found ${summary.totalIssues} issues. Recommended priority: ${summary.recommendedPriority}\n`);

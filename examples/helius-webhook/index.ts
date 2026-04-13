@@ -12,7 +12,7 @@
  *   PORT (optional) - Server port (default: 3000)
  */
 
-import express from 'express';
+import express, { type Express, type Request, type Response } from 'express';
 import chalk from 'chalk';
 import crypto from 'crypto';
 
@@ -391,118 +391,149 @@ function decodeAgencInstruction(data: string): { type: string; taskId: number } 
   }
 }
 
+function readRawRequestBody(body: unknown): Buffer {
+  if (Buffer.isBuffer(body)) {
+    return body;
+  }
+  if (typeof body === 'string') {
+    return Buffer.from(body, 'utf8');
+  }
+  return Buffer.from(JSON.stringify(body ?? {}), 'utf8');
+}
+
+function parseWebhookPayload(rawBody: Buffer): WebhookPayload[] | null {
+  try {
+    return JSON.parse(rawBody.toString('utf8')) as WebhookPayload[];
+  } catch {
+    return null;
+  }
+}
+
+function logWebhookReceipt(event: WebhookPayload): void {
+  console.log(chalk.gray('  Transaction:'), event.txnSignature?.slice(0, 20) + '...');
+  console.log(chalk.gray('  Slot:'), event.slot);
+}
+
+function logTaskCompletion(taskEvent: TaskCompletionEvent): void {
+  console.log(chalk.green('\n  Task Completed!'));
+  console.log(chalk.white('    Task ID:'), taskEvent.taskId);
+  console.log(chalk.white('    Worker:'), taskEvent.worker.slice(0, 20) + '...');
+  console.log(chalk.white('    Proof Verified:'), taskEvent.proofVerified);
+  console.log(chalk.white('    Signature:'), taskEvent.txSignature.slice(0, 30) + '...');
+  console.log();
+}
+
+function processWebhookEvents(payload: WebhookPayload[]): void {
+  console.log(chalk.cyan('\n[Webhook Received]'), new Date().toISOString());
+
+  for (const event of payload) {
+    logWebhookReceipt(event);
+    const taskEvent = parseTaskCompletion(event);
+    if (!taskEvent) {
+      continue;
+    }
+
+    completedTasks.push(taskEvent);
+    logTaskCompletion(taskEvent);
+    emitTaskCompletion(taskEvent);
+  }
+}
+
+function buildTaskStats(): {
+  total: number;
+  lastHour: number;
+  lastDay: number;
+  uniqueWorkers: number;
+} {
+  const now = Date.now();
+  const lastHour = completedTasks.filter((t) => now - t.timestamp * 1000 < 3600000);
+  const lastDay = completedTasks.filter((t) => now - t.timestamp * 1000 < 86400000);
+
+  return {
+    total: completedTasks.length,
+    lastHour: lastHour.length,
+    lastDay: lastDay.length,
+    uniqueWorkers: new Set(completedTasks.map((t) => t.worker)).size,
+  };
+}
+
+function handleWebhookRequest(req: Request, res: Response): void {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(clientIp)) {
+    console.warn(chalk.red('Rate limit exceeded for IP:'), clientIp);
+    res.status(429).json({ error: 'Rate limit exceeded' });
+    return;
+  }
+
+  const signature = req.headers['x-helius-signature'] as string | undefined;
+  const rawBody = readRawRequestBody(req.body);
+
+  if (!verifyWebhookSignature(rawBody.toString('utf8'), signature)) {
+    console.warn(chalk.red('Invalid webhook signature from IP:'), clientIp);
+    res.status(401).json({ error: 'Invalid signature' });
+    return;
+  }
+
+  const payload = parseWebhookPayload(rawBody);
+  if (!payload) {
+    console.warn(chalk.red('Invalid JSON payload'));
+    res.status(400).json({ error: 'Invalid JSON' });
+    return;
+  }
+
+  if (!isValidWebhookPayload(payload)) {
+    console.warn(chalk.red('Invalid webhook payload structure'));
+    res.status(400).json({ error: 'Invalid payload structure' });
+    return;
+  }
+
+  processWebhookEvents(payload);
+  res.status(200).json({ received: true });
+}
+
+function logServerStartup(): void {
+  console.log(chalk.bold('\nAgenC Helius Webhook Server'));
+  console.log(chalk.gray('================================'));
+  console.log(chalk.white('  Port:'), WEBHOOK_PORT);
+  console.log(chalk.white('  Monitoring:'));
+  console.log(chalk.gray('    - Router:'), ROUTER_PROGRAM_ID);
+  console.log(chalk.gray('    - Verifier:'), VERIFIER_PROGRAM_ID);
+  console.log(chalk.gray('    - AgenC:'), AGENC_PROGRAM_ID);
+  console.log();
+  console.log(chalk.yellow('Endpoints:'));
+  console.log(chalk.gray('  POST /webhook     - Helius webhook receiver'));
+  console.log(chalk.gray('  GET  /health      - Health check'));
+  console.log(chalk.gray('  GET  /api/tasks   - List completed tasks'));
+  console.log(chalk.gray('  GET  /api/stats   - Task statistics'));
+  console.log();
+}
+
+function registerServerRoutes(app: Express): void {
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', completedTasks: completedTasks.length });
+  });
+
+  app.post('/webhook', express.raw({ type: 'application/json' }), handleWebhookRequest);
+
+  app.get('/api/tasks', (_req, res) => {
+    res.json({
+      count: completedTasks.length,
+      tasks: completedTasks.slice(-100),
+    });
+  });
+
+  app.get('/api/stats', (_req, res) => {
+    res.json(buildTaskStats());
+  });
+}
+
 /**
  * Start webhook server
  */
 function startServer(): void {
   const app = express();
-  app.use(express.json());
-
-  // Health check
-  app.get('/health', (req, res) => {
-    res.json({ status: 'ok', completedTasks: completedTasks.length });
-  });
-
-  // Webhook endpoint with security checks
-  app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-    // SECURITY: Rate limiting
-    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-    if (!checkRateLimit(clientIp)) {
-      console.warn(chalk.red('Rate limit exceeded for IP:'), clientIp);
-      res.status(429).json({ error: 'Rate limit exceeded' });
-      return;
-    }
-
-    // SECURITY: Verify webhook signature
-    const signature = req.headers['x-helius-signature'] as string | undefined;
-    const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-
-    if (!verifyWebhookSignature(rawBody, signature)) {
-      console.warn(chalk.red('Invalid webhook signature from IP:'), clientIp);
-      res.status(401).json({ error: 'Invalid signature' });
-      return;
-    }
-
-    // Parse and validate payload
-    let payload: unknown;
-    try {
-      payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    } catch {
-      console.warn(chalk.red('Invalid JSON payload'));
-      res.status(400).json({ error: 'Invalid JSON' });
-      return;
-    }
-
-    // SECURITY: Validate payload structure
-    if (!isValidWebhookPayload(payload)) {
-      console.warn(chalk.red('Invalid webhook payload structure'));
-      res.status(400).json({ error: 'Invalid payload structure' });
-      return;
-    }
-
-    console.log(chalk.cyan('\n[Webhook Received]'), new Date().toISOString());
-
-    for (const event of payload) {
-      console.log(chalk.gray('  Transaction:'), event.txnSignature?.slice(0, 20) + '...');
-      console.log(chalk.gray('  Slot:'), event.slot);
-
-      const taskEvent = parseTaskCompletion(event);
-      if (taskEvent) {
-        completedTasks.push(taskEvent);
-
-        console.log(chalk.green('\n  Task Completed!'));
-        console.log(chalk.white('    Task ID:'), taskEvent.taskId);
-        console.log(chalk.white('    Worker:'), taskEvent.worker.slice(0, 20) + '...');
-        console.log(chalk.white('    Proof Verified:'), taskEvent.proofVerified);
-        console.log(chalk.white('    Signature:'), taskEvent.txSignature.slice(0, 30) + '...');
-        console.log();
-
-        // Emit event for real-time monitoring
-        emitTaskCompletion(taskEvent);
-      }
-    }
-
-    res.status(200).json({ received: true });
-  });
-
-  // API: List completed tasks
-  app.get('/api/tasks', (req, res) => {
-    res.json({
-      count: completedTasks.length,
-      tasks: completedTasks.slice(-100), // Last 100
-    });
-  });
-
-  // API: Task stats
-  app.get('/api/stats', (req, res) => {
-    const now = Date.now();
-    const lastHour = completedTasks.filter((t) => now - t.timestamp * 1000 < 3600000);
-    const lastDay = completedTasks.filter((t) => now - t.timestamp * 1000 < 86400000);
-
-    res.json({
-      total: completedTasks.length,
-      lastHour: lastHour.length,
-      lastDay: lastDay.length,
-      uniqueWorkers: new Set(completedTasks.map((t) => t.worker)).size,
-    });
-  });
-
-  app.listen(WEBHOOK_PORT, () => {
-    console.log(chalk.bold('\nAgenC Helius Webhook Server'));
-    console.log(chalk.gray('================================'));
-    console.log(chalk.white('  Port:'), WEBHOOK_PORT);
-    console.log(chalk.white('  Monitoring:'));
-    console.log(chalk.gray('    - Router:'), ROUTER_PROGRAM_ID);
-    console.log(chalk.gray('    - Verifier:'), VERIFIER_PROGRAM_ID);
-    console.log(chalk.gray('    - AgenC:'), AGENC_PROGRAM_ID);
-    console.log();
-    console.log(chalk.yellow('Endpoints:'));
-    console.log(chalk.gray('  POST /webhook     - Helius webhook receiver'));
-    console.log(chalk.gray('  GET  /health      - Health check'));
-    console.log(chalk.gray('  GET  /api/tasks   - List completed tasks'));
-    console.log(chalk.gray('  GET  /api/stats   - Task statistics'));
-    console.log();
-  });
+  registerServerRoutes(app);
+  app.listen(WEBHOOK_PORT, logServerStartup);
 }
 
 /**

@@ -232,14 +232,8 @@ class MockGameMaster:
 # Main demo
 # ============================================================================
 
-def run_demo():
-    print("=" * 60)
-    print("  AgenC x Concordia — Medieval Town Demo")
-    print("=" * 60)
-    print()
-
-    # Config
-    config = SimulationConfig(
+def build_demo_config() -> SimulationConfig:
+    return SimulationConfig(
         world_id="demo-medieval-town",
         workspace_id="concordia-demo",
         premise=(
@@ -271,20 +265,22 @@ def run_demo():
         control_port=3202,
     )
 
-    # 1. Start mock bridge
+
+def start_mock_bridge() -> tuple[HTTPServer, threading.Thread]:
     print("[1/4] Starting mock bridge on port 3200...")
     bridge_server = HTTPServer(("127.0.0.1", 3200), MockBridgeHandler)
     bridge_thread = threading.Thread(target=bridge_server.serve_forever, daemon=True)
     bridge_thread.start()
+    return bridge_server, bridge_thread
 
-    # 2. Start event server
-    print("[2/4] Starting event server on port 3201...")
-    print("       Connect a WebSocket client to ws://localhost:3201 to watch live!")
-    event_server = EventServer(port=3201)
+
+def start_demo_services(config: SimulationConfig) -> tuple[EventServer, SimulationState, HTTPServer]:
+    print(f"[2/4] Starting event server on port {config.event_port}...")
+    print(f"       Connect a WebSocket client to ws://localhost:{config.event_port} to watch live!")
+    event_server = EventServer(port=config.event_port)
     event_server.start()
 
-    # 3. Start control server
-    print("[3/4] Starting control server on port 3202...")
+    print(f"[3/4] Starting control server on port {config.control_port}...")
     controller = StepController()
     sim_state = SimulationState()
     sim_state.update(
@@ -293,10 +289,13 @@ def run_demo():
         agent_count=len(config.agents),
         running=True,
     )
-    control_srv = start_control_server(controller, sim_state, port=3202)
+    control_srv = start_control_server(controller, sim_state, port=config.control_port)
+    return event_server, sim_state, control_srv
 
-    # 4. Setup agents via bridge
+
+def setup_agents_via_bridge(config: SimulationConfig) -> None:
     import requests
+
     requests.post(f"{config.bridge_url}/setup", json={
         "world_id": config.world_id,
         "workspace_id": config.workspace_id,
@@ -307,8 +306,9 @@ def run_demo():
         "premise": config.premise,
     })
 
-    # Create proxy entities
-    proxy_entities = [
+
+def create_proxy_entities(config: SimulationConfig) -> list[ProxyEntityWithLogging]:
+    return [
         ProxyEntityWithLogging(
             agent_name=a.name,
             bridge_url=config.bridge_url,
@@ -319,33 +319,33 @@ def run_demo():
         for a in config.agents
     ]
 
-    # Create mock GM
-    gm = MockGameMaster(
-        agents=[a.name for a in config.agents],
-        premise=config.premise,
-    )
 
-    # Create engine
+def print_event_to_console(event: SimulationEvent) -> None:
+    if event.type == "observation":
+        print(f"  [OBS] GM → {event.agent_name}: {event.content}")
+    elif event.type == "action":
+        print(f"  [ACT] {event.agent_name}: {event.content}")
+    elif event.type == "resolution":
+        print(f"  [RES] {event.resolved_event or event.content}")
+    elif event.type == "scene_change":
+        print(f"  [SCENE] {event.content}")
+    elif event.type == "terminate":
+        print(f"  [END] {event.content}")
+
+
+def make_event_callback(event_server: EventServer):
     def event_callback(event: SimulationEvent):
         event_server.broadcast(event)
-        # Print to console for local viewing
-        if event.type == "observation":
-            print(f"  [OBS] GM → {event.agent_name}: {event.content}")
-        elif event.type == "action":
-            print(f"  [ACT] {event.agent_name}: {event.content}")
-        elif event.type == "resolution":
-            print(f"  [RES] {event.resolved_event or event.content}")
-        elif event.type == "scene_change":
-            print(f"  [SCENE] {event.content}")
-        elif event.type == "terminate":
-            print(f"  [END] {event.content}")
+        print_event_to_console(event)
 
-    engine = InstrumentedSequentialEngine(
-        event_callback=event_callback,
-        bridge_url=config.bridge_url,
-        world_id=config.world_id,
-    )
+    return event_callback
 
+
+def print_demo_header(config: SimulationConfig) -> None:
+    print("=" * 60)
+    print("  AgenC x Concordia — Medieval Town Demo")
+    print("=" * 60)
+    print()
     print(f"[4/4] Running simulation: {config.world_id}")
     print(f"       Agents: {', '.join(a.name for a in config.agents)}")
     print(f"       Steps: {config.max_steps}")
@@ -353,40 +353,82 @@ def run_demo():
     print("-" * 60)
     print()
 
+
+def print_demo_summary(
+    config: SimulationConfig,
+    event_server: EventServer,
+    proxy_entities: list[ProxyEntityWithLogging],
+) -> None:
+    print()
+    print("-" * 60)
+    print()
+    print(f"Simulation complete! {config.max_steps} steps, {len(config.agents)} agents.")
+    print(f"Events broadcast: {event_server.event_count}")
+    print()
+
+    for entity in proxy_entities:
+        log = entity.get_last_log()
+        if log:
+            print(f"  {entity.name} (last action): {log.get('action', 'N/A')}")
+            print(f"    Turns: {entity.turn_count}, Last latency: {log.get('elapsed_ms', 0):.0f}ms")
+
+
+def run_simulation(
+    config: SimulationConfig,
+    event_server: EventServer,
+    sim_state: SimulationState,
+) -> list[ProxyEntityWithLogging]:
+    setup_agents_via_bridge(config)
+    proxy_entities = create_proxy_entities(config)
+    gm = MockGameMaster(
+        agents=[a.name for a in config.agents],
+        premise=config.premise,
+    )
+    engine = InstrumentedSequentialEngine(
+        event_callback=make_event_callback(event_server),
+        bridge_url=config.bridge_url,
+        world_id=config.world_id,
+    )
+
+    def step_callback(step):
+        sim_state.update(step=step)
+        print(f"\n--- Step {step}/{config.max_steps} ---\n")
+
+    engine.run_loop(
+        game_masters=[gm],
+        entities=proxy_entities,
+        premise=config.premise,
+        max_steps=config.max_steps,
+        step_callback=step_callback,
+    )
+    return proxy_entities
+
+
+def shutdown_demo(
+    sim_state: SimulationState,
+    event_server: EventServer,
+    bridge_server: HTTPServer,
+    control_srv: HTTPServer,
+) -> None:
+    sim_state.update(running=False)
+    event_server.stop()
+    bridge_server.shutdown()
+    control_srv.shutdown()
+
+
+def run_demo():
+    config = build_demo_config()
+    bridge_server, _bridge_thread = start_mock_bridge()
+    event_server, sim_state, control_srv = start_demo_services(config)
+    print_demo_header(config)
+
     try:
-        def step_callback(step):
-            sim_state.update(step=step)
-            print(f"\n--- Step {step}/{config.max_steps} ---\n")
-
-        engine.run_loop(
-            game_masters=[gm],
-            entities=proxy_entities,
-            premise=config.premise,
-            max_steps=config.max_steps,
-            step_callback=step_callback,
-        )
-
-        print()
-        print("-" * 60)
-        print()
-        print(f"Simulation complete! {config.max_steps} steps, {len(config.agents)} agents.")
-        print(f"Events broadcast: {event_server.event_count}")
-        print()
-
-        # Show agent logs
-        for entity in proxy_entities:
-            log = entity.get_last_log()
-            if log:
-                print(f"  {entity.name} (last action): {log.get('action', 'N/A')}")
-                print(f"    Turns: {entity.turn_count}, Last latency: {log.get('elapsed_ms', 0):.0f}ms")
-
+        proxy_entities = run_simulation(config, event_server, sim_state)
+        print_demo_summary(config, event_server, proxy_entities)
     except KeyboardInterrupt:
         print("\nSimulation interrupted.")
     finally:
-        sim_state.update(running=False)
-        event_server.stop()
-        bridge_server.shutdown()
-        control_srv.shutdown()
+        shutdown_demo(sim_state, event_server, bridge_server, control_srv)
 
 
 if __name__ == "__main__":
